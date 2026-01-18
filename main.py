@@ -16,7 +16,6 @@ import os
 class TelemetryReceiver(QObject):
     """Handles UDP reception and MAVLink parsing"""
     
-    # Signals to update UI
     telemetry_updated = Signal(dict)
     connection_changed = Signal(bool)
     
@@ -27,7 +26,6 @@ class TelemetryReceiver(QObject):
         self.running = False
         self.last_heartbeat = 0
         
-        # Current telemetry data
         self.telemetry_data = {
             'connected': False,
             'flight_mode': 'Unknown',
@@ -44,14 +42,13 @@ class TelemetryReceiver(QObject):
             'gps_satellites': 0
         }
         
-        # Armed status stability variables
         self.armed_history = []
         self.max_history = 5
         self.last_stable_armed = False
 
         self.initial_battery = 24.9
         self.battery_start_time = time.time()
-        self.battery_drain_rate = 1.0  # 1 volt per minute (much faster)
+        self.battery_drain_rate = 1.0
         
     def start_receiving(self):
         """Start UDP reception in separate thread"""
@@ -60,7 +57,6 @@ class TelemetryReceiver(QObject):
         self.thread.daemon = True
         self.thread.start()
         
-        # Start connection monitor timer
         self.connection_timer = QTimer()
         self.connection_timer.timeout.connect(self._check_connection)
         self.connection_timer.start(1000)
@@ -77,7 +73,6 @@ class TelemetryReceiver(QObject):
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.socket.bind(('127.0.0.1', self.port))
             self.socket.settimeout(1.0)
-            print(f"UDP listener started on port {self.port}")
             
             while self.running:
                 try:
@@ -85,7 +80,6 @@ class TelemetryReceiver(QObject):
                     current_time = time.time()
                     self.last_heartbeat = current_time
                     if not self.telemetry_data['connected']:
-                        print("Data received - setting connected")
                         self.telemetry_data['connected'] = True
                         self.connection_changed.emit(True)
                     
@@ -133,22 +127,17 @@ class TelemetryReceiver(QObject):
         if msg.get_type() == 'HEARTBEAT':
             self.telemetry_data['flight_mode'] = "MISSION"
             
-            # Get new armed state
             new_armed_state = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
             
-            # Add to history
             self.armed_history.append(new_armed_state)
             if len(self.armed_history) > self.max_history:
                 self.armed_history.pop(0)
             
-            # Only update if we have enough readings and they're consistent
             if len(self.armed_history) >= 2:
-                # Check if last 2 readings are the same
                 if all(x == new_armed_state for x in self.armed_history[-2:]):
                     if self.last_stable_armed != new_armed_state:
                         self.telemetry_data['armed'] = new_armed_state
                         self.last_stable_armed = new_armed_state
-                        print(f"Armed status changed to: {new_armed_state}")
                     
         elif msg.get_type() == 'GLOBAL_POSITION_INT':
             raw_lat = msg.lat
@@ -156,11 +145,7 @@ class TelemetryReceiver(QObject):
             lat = msg.lat / 1e7
             lon = msg.lon / 1e7
             alt = msg.alt / 1000.0
-            
-            # Debug the raw values
-            print(f"RAW GPS: lat_raw={raw_lat}, lon_raw={raw_lon}")
-            print(f"CONVERTED GPS: lat={lat}, lon={lon}, alt={alt}")
-            
+                        
             self.telemetry_data['gps_lat'] = lat
             self.telemetry_data['gps_lon'] = lon
             self.telemetry_data['altitude'] = alt
@@ -175,7 +160,6 @@ class TelemetryReceiver(QObject):
             self.telemetry_data['yaw'] = msg.yaw * 57.2958
             
         elif msg.get_type() == 'SYS_STATUS':
-            # Simulate battery drain over time
             elapsed_minutes = (time.time() - self.battery_start_time) / 60.0
             simulated_voltage = max(18.0, self.initial_battery - (self.battery_drain_rate * elapsed_minutes))
             
@@ -222,31 +206,28 @@ class TelemetryReceiver(QObject):
 
 
 class TileDownloader(QObject):
-    """Async tile downloader with multiple servers"""
+    """Concurrent tile downloader with fallback servers"""
+    
+    MAX_WORKERS = 16
+    TILE_SERVERS = [
+        "https://tile.openstreetmap.org",
+        "https://a.tile.openstreetmap.org", 
+        "https://b.tile.openstreetmap.org",
+        "https://c.tile.openstreetmap.org"
+    ]
+    
     tile_downloaded = Signal(int, int, int, QPixmap)
     
     def __init__(self):
         super().__init__()
-        self.executor = ThreadPoolExecutor(max_workers=16)
-        
+        self.executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS)
         self.cache_dir = os.path.expanduser("~/.drone_map_cache")
         os.makedirs(self.cache_dir, exist_ok=True)
-        print(f"Persistent tile cache: {self.cache_dir}")
-        
-        self.tile_servers = [
-            "https://tile.openstreetmap.org",
-            "https://a.tile.openstreetmap.org", 
-            "https://b.tile.openstreetmap.org",
-            "https://c.tile.openstreetmap.org"
-        ]
         self.server_index = 0
         
     def download_tiles_batch(self, tile_requests):
-        """Download multiple tiles concurrently"""
-        futures = []
-        for zoom, x, y in tile_requests:
-            future = self.executor.submit(self._download_single_tile, zoom, x, y)
-            futures.append(future)
+        futures = [self.executor.submit(self._download_single_tile, zoom, x, y) 
+                   for zoom, x, y in tile_requests]
         
         for future in as_completed(futures):
             result = future.result()
@@ -255,14 +236,13 @@ class TileDownloader(QObject):
                 self.tile_downloaded.emit(zoom, x, y, pixmap)
     
     def _get_next_server(self):
-        """Get next server using round-robin"""
-        server = self.tile_servers[self.server_index]
-        self.server_index = (self.server_index + 1) % len(self.tile_servers)
+        server = self.TILE_SERVERS[self.server_index]
+        self.server_index = (self.server_index + 1) % len(self.TILE_SERVERS)
         return server
     
     def _download_single_tile(self, zoom, x, y):
-        """Download a single tile with fallback servers"""
         tile_path = os.path.join(self.cache_dir, f"{zoom}_{x}_{y}.png")
+        
         if os.path.exists(tile_path):
             try:
                 pixmap = QPixmap(tile_path)
@@ -271,10 +251,10 @@ class TileDownloader(QObject):
             except Exception:
                 try:
                     os.remove(tile_path)
-                except:
+                except OSError:
                     pass
         
-        for attempt in range(len(self.tile_servers)):
+        for _ in range(len(self.TILE_SERVERS)):
             server = self._get_next_server()
             try:
                 url = f"{server}/{zoom}/{x}/{y}.png"
@@ -293,27 +273,15 @@ class TileDownloader(QObject):
                         
                         pixmap = QPixmap(tile_path)
                         if not pixmap.isNull():
-                            print(f"Downloaded tile {zoom}/{x}/{y} from {server}")
                             return (zoom, x, y, pixmap)
-                    except Exception as e:
-                        print(f"Error saving tile {zoom}/{x}/{y}: {e}")
+                    except Exception:
                         continue
-                        
-                elif response.status_code == 429:
-                    print(f"Rate limited on {server}, trying next server...")
-                    continue
-                else:
-                    print(f"HTTP {response.status_code} from {server}")
-                    continue
                     
             except requests.exceptions.Timeout:
-                print(f"Timeout from {server}, trying next server...")
                 continue
-            except Exception as e:
-                print(f"Error downloading from {server}: {e}")
+            except Exception:
                 continue
         
-        print(f"Failed to download tile {zoom}/{x}/{y} from all servers")
         return None
 
 
@@ -324,27 +292,22 @@ class MapWidget(QWidget):
         super().__init__()
         self.setMinimumSize(600, 400)
         
-        # Map parameters
-        self.center_lat = 41.0082  # Istanbul
+        self.center_lat = 41.0082  
         self.center_lon = 28.9784
         self.zoom = 13
         self.tile_size = 256
         
-        # Mouse interaction
         self.last_mouse_pos = QPoint()
         self.is_dragging = False
         
-        # Drone position and heading
         self.drone_lat = None
         self.drone_lon = None
         self.drone_heading = 0.0
         
-        # Tile cache and downloader
         self.tiles = {}
         self.downloader = TileDownloader()
         self.downloader.tile_downloaded.connect(self.on_tile_downloaded)
         
-        # Load initial tiles
         self.load_tiles_around_center(radius=2)
         
     def deg2num(self, lat_deg, lon_deg, zoom):
@@ -387,7 +350,6 @@ class MapWidget(QWidget):
         tile_requests = [tile for _, tile in priorities]
         
         if tile_requests:
-            print(f"Requesting {len(tile_requests)} tiles (priority order)...")
             threading.Thread(
                 target=self.downloader.download_tiles_batch, 
                 args=(tile_requests,),
@@ -420,8 +382,6 @@ class MapWidget(QWidget):
         for tile_key in tiles_to_remove:
             del self.tiles[tile_key]
         
-        if tiles_to_remove:
-            print(f"Cleaned up {len(tiles_to_remove)} old tiles from memory")
     
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press for dragging"""
@@ -482,7 +442,6 @@ class MapWidget(QWidget):
         self.tiles.clear()
         self.load_tiles_around_center(radius=3)
         
-        print(f"Zoomed to level {self.zoom}, center: {self.center_lat:.6f}, {self.center_lon:.6f}")
     
     def paintEvent(self, event):
         """Paint the map"""
@@ -555,7 +514,6 @@ class MapWidget(QWidget):
             if -100 <= drone_x <= self.width() + 100 and -100 <= drone_y <= self.height() + 100:
                 self._draw_drone_arrow(painter, drone_x, drone_y, self.drone_heading)
         else:
-            print("Scale calculation failed, drawing drone at center")
             self._draw_drone_arrow(painter, self.width() // 2, self.height() // 2, self.drone_heading)
     
     def _draw_drone_arrow(self, painter, x, y, heading_deg):
@@ -623,14 +581,11 @@ class MapWidget(QWidget):
             self.drone_lon = lon
             
             if first_gps_lock:
-                print(f"🎯 First GPS lock acquired! Auto-zooming to drone position...")
-                print(f"High precision coordinates: {lat:.8f}, {lon:.8f}")
                 self.center_lat = lat
                 self.center_lon = lon
                 self.zoom = 18
                 self.tiles.clear()
                 self.load_tiles_around_center(radius=3)
-                print(f"Map centered and zoomed to: {lat:.8f}, {lon:.8f} at zoom {self.zoom}")
             else:
                 distance = ((lat - self.center_lat) ** 2 + (lon - self.center_lon) ** 2) ** 0.5
                 if distance > 0.01:
@@ -642,10 +597,9 @@ class MapWidget(QWidget):
             self.update()
         else:
             if self.drone_lat is not None:
-                print("❌ GPS lock lost")
-            self.drone_lat = None
-            self.drone_lon = None
-            self.update()
+                self.drone_lat = None
+                self.drone_lon = None
+                self.update()
     
     def update_drone_heading(self, heading):
         """Update drone heading for arrow direction"""
@@ -661,51 +615,38 @@ class DroneMonitorUI(QMainWindow):
         self.setWindowTitle("Drone Telemetry Monitor")
         self.setGeometry(100, 100, 1200, 800)
         
-        # Initialize image icons
         self.images = {}
         self._load_images()
 
-        # Set window icon (ADD THIS LINE)
         if 'logo' in self.images and self.images['logo']:
             self.setWindowIcon(QIcon(self.images['logo']))
         
-        # Create central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        # Main layout - horizontal (left side + right side)
         main_layout = QHBoxLayout(central_widget)
 
-        # Left side - vertical layout for telemetry + map
         left_layout = QVBoxLayout()
 
-        # Top: telemetry panel
         telemetry_panel = self._create_telemetry_panel()
         left_layout.addWidget(telemetry_panel)
 
-        # Bottom: map
         self.map_widget = MapWidget()
-        left_layout.addWidget(self.map_widget, 1)  # Map takes most space
+        left_layout.addWidget(self.map_widget, 1)  
 
-        # Add left layout to main
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
-        main_layout.addWidget(left_widget, 6)  # Left side takes 2/3
+        main_layout.addWidget(left_widget, 6)  
 
-        # Right panel
         right_panel = self._create_right_panel()
-        main_layout.addWidget(right_panel, 1)  # Right side takes 1/3
+        main_layout.addWidget(right_panel, 1)  
         
-        # Initialize telemetry receiver
         self.telemetry_receiver = TelemetryReceiver(port=14551)
         self.telemetry_receiver.telemetry_updated.connect(self._update_telemetry_display)
         self.telemetry_receiver.connection_changed.connect(self._update_connection_status)
         
-        # Start receiving telemetry
-        # self.telemetry_receiver.start_receiving()
     
     def _load_images(self):
         """Load all UI images - PyInstaller compatible"""
-        # Handle PyInstaller bundled resources
         if hasattr(sys, '_MEIPASS'):
             base_path = sys._MEIPASS
         else:
@@ -732,15 +673,11 @@ class DroneMonitorUI(QMainWindow):
                     if not pixmap.isNull():
                         scaled_pixmap = pixmap.scaled(24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                         self.images[name] = scaled_pixmap
-                        print(f"✅ Loaded image: {name}")
                     else:
-                        print(f"❌ Failed to load image: {filepath} (invalid format)")
                         self.images[name] = None
                 else:
-                    print(f"⚠️ Image not found: {filepath}")
                     self.images[name] = None
             except Exception as e:
-                print(f"❌ Error loading {filepath}: {e}")
                 self.images[name] = None
     
     def _create_image_label(self, image_name):
@@ -750,7 +687,6 @@ class DroneMonitorUI(QMainWindow):
         if image_name in self.images and self.images[image_name]:
             label.setPixmap(self.images[image_name])
         else:
-            # Fallback: show text if image not available
             label.setText("●")
             label.setStyleSheet("color: gray;")
         
@@ -761,18 +697,13 @@ class DroneMonitorUI(QMainWindow):
     def _create_telemetry_panel(self):
         """Create the telemetry data panel with images - horizontal grid layout"""
         panel = QWidget()
-        panel.setMaximumHeight(120)  # Limit height to keep it compact
+        panel.setMaximumHeight(120)  
         
-        # Use grid layout - horizontal arrangement
         grid_layout = QGridLayout(panel)
-        
-        # Row 0: Icons
-        # Row 1: Labels  
-        # Row 2: Values
+
         
         col = 0
         
-        # Connection
         self.connection_icon = self._create_image_label('connection_off')
         grid_layout.addWidget(self.connection_icon, 0, col, Qt.AlignCenter)
         self.label_connection_status = QLabel("Disconnected")
@@ -780,7 +711,6 @@ class DroneMonitorUI(QMainWindow):
         grid_layout.addWidget(self.label_connection_status, 1, col, Qt.AlignCenter)
         col += 1
         
-        # Flight Mode
         flight_mode_icon = self._create_image_label('drone')
         grid_layout.addWidget(flight_mode_icon, 0, col, Qt.AlignCenter)
         grid_layout.addWidget(QLabel("Flight Mode"), 1, col, Qt.AlignCenter)
@@ -788,7 +718,6 @@ class DroneMonitorUI(QMainWindow):
         grid_layout.addWidget(self.label_flight_mode, 2, col, Qt.AlignCenter)
         col += 1
         
-        # Armed Status  
         self.armed_icon = self._create_image_label('shield_green')
         grid_layout.addWidget(self.armed_icon, 0, col, Qt.AlignCenter)
         grid_layout.addWidget(QLabel("Armed"), 1, col, Qt.AlignCenter)
@@ -796,7 +725,6 @@ class DroneMonitorUI(QMainWindow):
         grid_layout.addWidget(self.label_armed_status, 2, col, Qt.AlignCenter)
         col += 1
         
-        # GPS
         gps_icon = self._create_image_label('satellite')
         grid_layout.addWidget(gps_icon, 0, col, Qt.AlignCenter)
         grid_layout.addWidget(QLabel("GPS"), 1, col, Qt.AlignCenter)
@@ -804,7 +732,6 @@ class DroneMonitorUI(QMainWindow):
         grid_layout.addWidget(self.label_gps_coordinates, 2, col, Qt.AlignCenter)
         col += 1
         
-        # Altitude
         alt_icon = self._create_image_label('altitude')
         grid_layout.addWidget(alt_icon, 0, col, Qt.AlignCenter)
         grid_layout.addWidget(QLabel("Altitude"), 1, col, Qt.AlignCenter)
@@ -812,7 +739,6 @@ class DroneMonitorUI(QMainWindow):
         grid_layout.addWidget(self.label_altitude, 2, col, Qt.AlignCenter)
         col += 1
         
-        # Speed
         speed_icon = self._create_image_label('speed')
         grid_layout.addWidget(speed_icon, 0, col, Qt.AlignCenter)
         grid_layout.addWidget(QLabel("Speed"), 1, col, Qt.AlignCenter)
@@ -820,7 +746,6 @@ class DroneMonitorUI(QMainWindow):
         grid_layout.addWidget(self.label_ground_speed, 2, col, Qt.AlignCenter)
         col += 1
         
-        # Heading
         compass_icon = self._create_image_label('compass')
         grid_layout.addWidget(compass_icon, 0, col, Qt.AlignCenter)
         grid_layout.addWidget(QLabel("Heading"), 1, col, Qt.AlignCenter)
@@ -828,7 +753,6 @@ class DroneMonitorUI(QMainWindow):
         grid_layout.addWidget(self.label_heading, 2, col, Qt.AlignCenter)
         col += 1
         
-        # Battery
         battery_icon = self._create_image_label('battery')
         grid_layout.addWidget(battery_icon, 0, col, Qt.AlignCenter)
         grid_layout.addWidget(QLabel("Battery"), 1, col, Qt.AlignCenter)
@@ -841,7 +765,6 @@ class DroneMonitorUI(QMainWindow):
         """Update all telemetry displays"""
         self.label_flight_mode.setText(data['flight_mode'])
         
-        # Update armed status and icon
         if data['armed']:
             self.label_armed_status.setText("Armed")
             self.label_armed_status.setStyleSheet("color: red; font-weight: bold;")
@@ -859,7 +782,6 @@ class DroneMonitorUI(QMainWindow):
         self.label_heading.setText(f"{data['heading']:.1f}")
         
         
-        # Update map with position and heading
         self.map_widget.update_drone_position(data['gps_lat'], data['gps_lon'])
         self.map_widget.update_drone_heading(data['heading'])
         
@@ -881,12 +803,10 @@ class DroneMonitorUI(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         
-        # Text logo instead of image
         logo_widget = QWidget()
         logo_layout = QVBoxLayout(logo_widget)
-        logo_layout.setSpacing(1)  # Small gap between lines
+        logo_layout.setSpacing(1)  
         
-        # "Horizon 7" in cyan
         horizon_label = QLabel("Horizon 7")
         horizon_label.setAlignment(Qt.AlignCenter)
         horizon_label.setStyleSheet("""
@@ -896,7 +816,6 @@ class DroneMonitorUI(QMainWindow):
             margin: 0px;
         """)
         
-        # "Custom UI" in black, smaller
         custom_label = QLabel("Ground Control Station")
         custom_label.setAlignment(Qt.AlignCenter)
         custom_label.setStyleSheet("""
@@ -908,25 +827,21 @@ class DroneMonitorUI(QMainWindow):
         
         logo_layout.addWidget(horizon_label)
         logo_layout.addWidget(custom_label)
-        logo_widget.setFixedHeight(80)  # Compact height
+        logo_widget.setFixedHeight(80)  
         
         layout.addWidget(logo_widget)
         
-        # Add other content below the logo
-        layout.addWidget(QLabel(""))  # Small spacer
+        layout.addWidget(QLabel(""))  
 
-        # Connection section
         connection_widget = QWidget()
         connection_layout = QVBoxLayout(connection_widget)
 
-        # UDP Port label
         udp_label = QLabel("UDP Port:")
         udp_label.setStyleSheet("font-weight: bold; font-size: 12px;")
         connection_layout.addWidget(udp_label)
 
-        # UDP Port input field
         self.udp_input = QLineEdit()
-        self.udp_input.setText("14551")  # Default port
+        self.udp_input.setText("14551")  
         self.udp_input.setPlaceholderText("Enter UDP port...")
         self.udp_input.setStyleSheet("""
             QLineEdit {
@@ -938,10 +853,8 @@ class DroneMonitorUI(QMainWindow):
         """)
         connection_layout.addWidget(self.udp_input)
 
-        # Small spacer
         connection_layout.addWidget(QLabel(""))
 
-        # Connect button
         self.connect_button = QPushButton("Connect")
         self.connect_button.setStyleSheet("""
             QPushButton {
@@ -960,28 +873,24 @@ class DroneMonitorUI(QMainWindow):
                 background-color: #3d8b40;
             }
         """)
-        self.connect_button.clicked.connect(self._fake_connect)
+        self.connect_button.clicked.connect(self._toggle_connection)
         connection_layout.addWidget(self.connect_button)
 
         layout.addWidget(connection_widget)
 
-        # Add separator line
         separator = QLabel()
         separator.setFixedHeight(2)
         separator.setStyleSheet("background-color: #CCCCCC; margin: 10px 0px;")
         layout.addWidget(separator)
 
-        # Drone Launch Section
         launch_widget = QWidget()
         launch_layout = QVBoxLayout(launch_widget)
 
-        # Section title
         launch_title = QLabel("Launch Drones")
         launch_title.setStyleSheet("font-weight: bold; font-size: 14px; margin-bottom: 5px;")
         launch_title.setAlignment(Qt.AlignCenter)
         launch_layout.addWidget(launch_title)
 
-        # Create 4 drone buttons in 2x2 grid
         buttons_layout = QGridLayout()
 
         for i in range(1, 5):
@@ -1006,7 +915,6 @@ class DroneMonitorUI(QMainWindow):
             """)
             drone_button.clicked.connect(lambda checked, drone_id=i: self._launch_drone(drone_id))
             
-            # Arrange in 2x2 grid
             row = (i - 1) // 2
             col = (i - 1) % 2
             buttons_layout.addWidget(drone_button, row, col)
@@ -1020,21 +928,17 @@ class DroneMonitorUI(QMainWindow):
         
         return panel
 
-    def _fake_connect(self):
+    def _toggle_connection(self):
         """Real connect/disconnect functionality"""
         if self.connect_button.text() == "Connect":
-            # Get port from input
             try:
                 port = int(self.udp_input.text())
             except ValueError:
-                print("Invalid port number!")
                 return
             
-            # Start real connection
             self.telemetry_receiver.port = port
             self.telemetry_receiver.start_receiving()
             
-            # Update button to disconnect state
             self.connect_button.setText("Disconnect")
             self.connect_button.setStyleSheet("""
                 QPushButton {
@@ -1050,13 +954,10 @@ class DroneMonitorUI(QMainWindow):
                     background-color: #da190b;
                 }
             """)
-            print(f"Connecting to UDP port {port}...")
             
         else:
-            # Disconnect
             self.telemetry_receiver.stop_receiving()
             
-            # Update button to connect state
             self.connect_button.setText("Connect")
             self.connect_button.setStyleSheet("""
                 QPushButton {
@@ -1072,9 +973,7 @@ class DroneMonitorUI(QMainWindow):
                     background-color: #45a049;
                 }
             """)
-            print("Disconnected from UDP")
             
-            # Reset connection status display
             self._update_connection_status(False)
     
     def closeEvent(self, event):
@@ -1090,7 +989,6 @@ def main():
     app = QApplication(sys.argv)
     app.setStyle('WindowsVista')
 
-    # Add custom grey theme
     app.setStyleSheet("""
         QWidget {
             background-color: #F0F0F0;
@@ -1113,30 +1011,24 @@ def main():
         }
     """)
     
-    # Create main window
     window = DroneMonitorUI()
     
-    # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
-        print("\nShutting down...")
         window.telemetry_receiver.stop_receiving()
         app.quit()
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
     
-    # Show window
     window.show()
     
-    # Enable Ctrl+C in Qt
     timer = QTimer()
-    timer.start(500)  # Check for signals every 500ms
+    timer.start(500)  
     timer.timeout.connect(lambda: None)
     
     try:
         sys.exit(app.exec())
     except KeyboardInterrupt:
-        print("\nShutting down...")
         window.telemetry_receiver.stop_receiving()
         sys.exit(0)
 
